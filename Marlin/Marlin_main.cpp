@@ -1342,6 +1342,10 @@ bool get_target_extruder_from_command(const uint16_t code) {
 
 #endif // DUAL_X_CARRIAGE
 
+#if UVLO_SUPPORT
+  setup_uvlo_interrupt();
+#endif //UVLO_SUPPORT
+
 #if HAS_WORKSPACE_OFFSET || ENABLED(DUAL_X_CARRIAGE) || ENABLED(DELTA)
 
   /**
@@ -8594,6 +8598,205 @@ inline void gcode_M109() {
     KEEPALIVE_STATE(IN_HANDLER);
   #endif
 }
+
+#if UVLO_SUPPORT
+  void setup_uvlo_interrupt() {
+    DDRE &= ~(1 << 4);
+    PORTE &= ~(1 << 4);
+
+    EICRB |= (1 << 0);
+	EICRB &= ~(1 << 1);
+
+	//enable INT4 interrupt
+	EIMSK |= (1 << 4);
+  }
+
+  ISR(INT4_vect) {
+    EIMSK &= ~(1 << 4);
+    SERIAL_ECHOLNPGM("INT4");
+    if(IS_SD_PRINTING && (!(eeprom_read_byte((uint8_t*)EEPROM_UVLO))) ) uvlo_();
+    if(eeprom_read_byte((uint8_t*)EEPROM_UVLO)) uvlo_tiny();
+  }
+
+  void recover_print(uint8_t automatic) {
+	char cmd[30];
+	lcd_update_enable(true);
+	lcd_update(2);
+	lcd_setstatuspgm(_i("Recovering print    "));////MSG_RECOVERING_PRINT c=20 r=1
+
+    bool bTiny=(eeprom_read_byte((uint8_t*)EEPROM_UVLO)==2);
+    recover_machine_state_after_power_panic(bTiny); //recover position, temperatures and extrude_multipliers
+    
+    // Lift the print head, so one may remove the excess priming material.
+    if(!bTiny&&(current_position[Z_AXIS]<25))
+      enqueue_and_echo_commands_P(PSTR("G1 Z25 F800"));
+    // Home X and Y axes. Homing just X and Y shall not touch the babystep and the world2machine transformation status.
+	enqueue_and_echo_commands_P(PSTR("G28 X Y"));
+    // Set the target bed and nozzle temperatures and wait.
+	sprintf_P(cmd, PSTR("M109 S%d"), thermalManager.target_temperature[active_extruder]);
+	enqueue_and_echo_command(cmd);
+	sprintf_P(cmd, PSTR("M190 S%d"), thermalManager.target_temperature_bed);
+	enqueue_and_echo_command(cmd);
+    enqueue_and_echo_commands_P(PSTR("M83")); //E axis relative mode
+	//enquecommand_P(PSTR("G1 E5 F120")); //Extrude some filament to stabilize pessure
+    // If not automatically recoreverd (long power loss), extrude extra filament to stabilize 
+    if(automatic == 0){ 
+      enquecommand_P(PSTR("G1 E5 F120")); //Extrude some filament to stabilize pessure 
+    } 
+	enquecommand_P(PSTR("G1 E"  STRINGIFY(-default_retraction)" F480"));
+
+	printf_P(_N("After waiting for temp:\nCurrent pos X_AXIS:%.3f\nCurrent pos Y_AXIS:%.3f\n"), current_position[X_AXIS], current_position[Y_AXIS]);
+
+    // Restart the print.
+	restore_print_from_eeprom();
+
+	printf_P(_N("Current pos Z_AXIS:%.3f\nCurrent pos E_AXIS:%.3f\n"), current_position[Z_AXIS], current_position[E_AXIS]);
+  }
+
+  void recover_machine_state_after_power_panic(bool bTiny)
+  {
+    char cmd[30];
+    // 1) Recover the logical cordinates at the time of the power panic.
+    // The logical XY coordinates are needed to recover the machine Z coordinate corrected by the mesh bed leveling.
+    current_position[X_AXIS] = eeprom_read_float((float*)(EEPROM_UVLO_CURRENT_POSITION + 0));
+    current_position[Y_AXIS] = eeprom_read_float((float*)(EEPROM_UVLO_CURRENT_POSITION + 4));
+    // Recover the logical coordinate of the Z axis at the time of the power panic.
+    // The current position after power panic is moved to the next closest 0th full step.
+    if(bTiny)
+      current_position[Z_AXIS] = eeprom_read_float((float*)(EEPROM_UVLO_TINY_CURRENT_POSITION_Z)) + UVLO_Z_AXIS_SHIFT + float((1024 - eeprom_read_word((uint16_t*)(EEPROM_UVLO_TINY_Z_MICROSTEPS)) + 7) >> 4) / cs.axis_steps_per_unit[Z_AXIS];
+    else
+      current_position[Z_AXIS] = eeprom_read_float((float*)(EEPROM_UVLO_CURRENT_POSITION_Z)) + UVLO_Z_AXIS_SHIFT + float((1024 - eeprom_read_word((uint16_t*)(EEPROM_UVLO_Z_MICROSTEPS)) + 7) >> 4) / cs.axis_steps_per_unit[Z_AXIS];
+    if (eeprom_read_byte((uint8_t*)EEPROM_UVLO_E_ABS)) {
+	  current_position[E_AXIS] = eeprom_read_float((float*)(EEPROM_UVLO_CURRENT_POSITION_E));
+	  sprintf_P(cmd, PSTR("G92 E"));
+	  dtostrf(current_position[E_AXIS], 6, 3, cmd + strlen(cmd));
+	  enqueue_and_echo_commands(cmd);
+  }
+
+  memcpy(destination, current_position, sizeof(destination));
+
+  SERIAL_ECHOPGM("recover_machine_state_after_power_panic, initial ");
+  print_world_coordinates();
+
+  // 2) Initialize the logical to physical coordinate system transformation.
+  world2machine_initialize();
+
+  // 3) Restore the mesh bed leveling offsets. This is 2*7*7=98 bytes, which takes 98*3.4us=333us in worst case.
+  mbl.active = false;
+  for (int8_t mesh_point = 0; mesh_point < MESH_NUM_X_POINTS * MESH_NUM_Y_POINTS; ++ mesh_point) {
+    uint8_t ix = mesh_point % MESH_NUM_X_POINTS; // from 0 to MESH_NUM_X_POINTS - 1
+    uint8_t iy = mesh_point / MESH_NUM_X_POINTS;
+    // Scale the z value to 10u resolution.
+    int16_t v;
+    eeprom_read_block(&v, (void*)(EEPROM_UVLO_MESH_BED_LEVELING_FULL+2*mesh_point), 2);
+    if (v != 0)
+      mbl.active = true;
+    mbl.z_values[iy][ix] = float(v) * 0.001f;
+    
+  }
+//  SERIAL_ECHOPGM("recover_machine_state_after_power_panic, initial ");
+//  print_mesh_bed_leveling_table();
+
+  // 4) Load the baby stepping value, which is expected to be active at the time of power panic.
+  // The baby stepping value is used to reset the physical Z axis when rehoming the Z axis.
+  babystep_load();
+
+  // 5) Set the physical positions from the logical positions using the world2machine transformation and the active bed leveling.
+  plan_set_position(current_position[X_AXIS], current_position[Y_AXIS], current_position[Z_AXIS], current_position[E_AXIS]);
+
+  // 6) Power up the motors, mark their positions as known.
+  //FIXME Verfiy, whether the X and Y axes should be powered up here, as they will later be re-homed anyway.
+  axis_known_position[X_AXIS] = true; enable_x();
+  axis_known_position[Y_AXIS] = true; enable_y();
+  axis_known_position[Z_AXIS] = true; enable_z();
+
+  SERIAL_ECHOPGM("recover_machine_state_after_power_panic, initial ");
+  print_physical_coordinates();
+
+  // 7) Recover the target temperatures.
+  target_temperature[active_extruder] = eeprom_read_byte((uint8_t*)EEPROM_UVLO_TARGET_HOTEND);
+  target_temperature_bed = eeprom_read_byte((uint8_t*)EEPROM_UVLO_TARGET_BED);
+
+  // 8) Recover extruder multipilers
+  extruder_multiplier[0] = eeprom_read_float((float*)(EEPROM_EXTRUDER_MULTIPLIER_0));
+#if EXTRUDERS > 1
+  extruder_multiplier[1] = eeprom_read_float((float*)(EEPROM_EXTRUDER_MULTIPLIER_1));
+#if EXTRUDERS > 2
+  extruder_multiplier[2] = eeprom_read_float((float*)(EEPROM_EXTRUDER_MULTIPLIER_2));
+#endif
+#endif
+  extrudemultiply = (int)eeprom_read_word((uint16_t*)(EEPROM_EXTRUDEMULTIPLY));
+}
+
+void restore_print_from_eeprom() {
+	int feedrate_rec;
+	uint8_t fan_speed_rec;
+	char cmd[30];
+	char filename[13];
+	uint8_t depth = 0;
+	char dir_name[9];
+
+	fan_speed_rec = eeprom_read_byte((uint8_t*)EEPROM_UVLO_FAN_SPEED);
+	EEPROM_read_B(EEPROM_UVLO_FEEDRATE, &feedrate_rec);
+	SERIAL_ECHOPGM("Feedrate:");
+	MYSERIAL.println(feedrate_rec);
+
+	depth = eeprom_read_byte((uint8_t*)EEPROM_DIR_DEPTH);
+	
+	MYSERIAL.println(int(depth));
+	for (int i = 0; i < depth; i++) {
+		for (int j = 0; j < 8; j++) {
+			dir_name[j] = eeprom_read_byte((uint8_t*)EEPROM_DIRS + j + 8 * i);
+		}
+		dir_name[8] = '\0';
+		MYSERIAL.println(dir_name);
+		strcpy(dir_names[i], dir_name);
+		card.chdir(dir_name);
+	}
+
+	for (int i = 0; i < 8; i++) {
+		filename[i] = eeprom_read_byte((uint8_t*)EEPROM_FILENAME + i);
+	}
+	filename[8] = '\0';
+
+	MYSERIAL.print(filename);
+	strcat_P(filename, PSTR(".gco"));
+	sprintf_P(cmd, PSTR("M23 %s"), filename);
+	enquecommand(cmd);
+	uint32_t position = eeprom_read_dword((uint32_t*)(EEPROM_FILE_POSITION));
+	SERIAL_ECHOPGM("Position read from eeprom:");
+	MYSERIAL.println(position);	
+  // E axis relative mode.
+	enquecommand_P(PSTR("M83"));
+  // Move to the XY print position in logical coordinates, where the print has been killed.
+	strcpy_P(cmd, PSTR("G1 X")); strcat(cmd, ftostr32(eeprom_read_float((float*)(EEPROM_UVLO_CURRENT_POSITION + 0))));
+	strcat_P(cmd, PSTR(" Y"));   strcat(cmd, ftostr32(eeprom_read_float((float*)(EEPROM_UVLO_CURRENT_POSITION + 4))));
+	strcat_P(cmd, PSTR(" F2000"));
+	enquecommand(cmd);
+  // Move the Z axis down to the print, in logical coordinates.
+	strcpy_P(cmd, PSTR("G1 Z")); strcat(cmd, ftostr32(eeprom_read_float((float*)(EEPROM_UVLO_CURRENT_POSITION_Z))));
+	enquecommand(cmd);
+  // Unretract.
+	enquecommand_P(PSTR("G1 E"  STRINGIFY(2*default_retraction)" F480"));
+  // Set the feedrate saved at the power panic.
+	sprintf_P(cmd, PSTR("G1 F%d"), feedrate_rec);
+	enquecommand(cmd);
+	if (eeprom_read_byte((uint8_t*)EEPROM_UVLO_E_ABS))
+	{
+	  enquecommand_P(PSTR("M82")); //E axis abslute mode
+	}
+  // Set the fan speed saved at the power panic.
+	strcpy_P(cmd, PSTR("M106 S"));
+	strcat(cmd, itostr3(int(fan_speed_rec)));
+	enquecommand(cmd);
+
+  // Set a position in the file.
+  sprintf_P(cmd, PSTR("M26 S%lu"), position);
+  enquecommand(cmd);
+  enquecommand_P(PSTR("G4 S0")); 
+  enquecommand_P(PSTR("PRUSA uvlo"));
+}
+#endif
 
 #if HAS_HEATED_BED
 
